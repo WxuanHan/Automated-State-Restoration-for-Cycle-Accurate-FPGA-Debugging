@@ -1,0 +1,368 @@
+`timescale 1ns / 1ps
+//////////////////////////////////////////////////////////////////////////////////
+// Company: 
+// Engineer: 
+// 
+// Create Date: 2025/09/19 18:32:55
+// Design Name: 
+// Module Name: frame_manager
+// Project Name: 
+// Target Devices: 
+// Tool Versions: 
+// Description: 
+// 
+// Dependencies: 
+// 
+// Revision:
+// Revision 0.01 - File Created
+// Additional Comments:
+// 
+//////////////////////////////////////////////////////////////////////////////////
+
+module frame_manager #(
+    parameter integer WBUS_BYTES           = 4,          // AXI-Stream data bus width in bytes (default 32-bit)
+    parameter integer AXIL_ADDR_WIDTH      = 6,          // 64B register aperture
+    parameter integer AXIL_DATA_WIDTH      = 32
+)(
+    // Clocks & reset
+    input  wire                       clk,               // data plane clock (AXIS/DMA domain)
+    input  wire                       rstn,              // active-low sync reset (data clock domain)
+
+    // AXI4-Stream (data producer -> FM -> DMA write channel)
+    input  wire [WBUS_BYTES*8-1:0]    s_axis_tdata,
+    input  wire                       s_axis_tvalid,
+    output wire                       s_axis_tready,
+    output reg                        s_axis_tlast,
+
+    // Stream buffer / producer status
+    input  wire                       fifo_stream_empty,       // asserted when no data available
+    input  wire                       fifo_stream_almost_full, // optional, tie-low if unused
+
+    // DMA handshake (toward AXI DMA S2MM)
+    output reg                        dma_start,         // one-cycle start pulse when a frame is ready
+    input  wire                       dma_done,          // asserted when current burst completed
+    output reg  [31:0]                dma_length_bytes,  // burst length in bytes = FRAME_LEN * WBUS_BYTES
+
+    // DSAS counters (observable)
+    output reg  [31:0]                transition_num,    // transactions within the current frame
+    output reg  [31:0]                dsas_cycle_num,    // global cycle index (see note below)
+
+    // AXI4-Lite control/status (PS <-> FM)
+    input  wire                       s_axi_aclk,
+    input  wire                       s_axi_aresetn,
+    input  wire [AXIL_ADDR_WIDTH-1:0] s_axi_awaddr,
+    input  wire                       s_axi_awvalid,
+    output reg                        s_axi_awready,
+    input  wire [AXIL_DATA_WIDTH-1:0] s_axi_wdata,
+    input  wire [AXIL_DATA_WIDTH/8-1:0] s_axi_wstrb,
+    input  wire                       s_axi_wvalid,
+    output reg                        s_axi_wready,
+    output reg  [1:0]                 s_axi_bresp,
+    output reg                        s_axi_bvalid,
+    input  wire                       s_axi_bready,
+    input  wire [AXIL_ADDR_WIDTH-1:0] s_axi_araddr,
+    input  wire                       s_axi_arvalid,
+    output reg                        s_axi_arready,
+    output reg  [AXIL_DATA_WIDTH-1:0] s_axi_rdata,
+    output reg  [1:0]                 s_axi_rresp,
+    output reg                        s_axi_rvalid,
+    input  wire                       s_axi_rready
+);
+
+    // =========================================================================
+    // AXI-Lite Register Map (word-aligned addresses)
+    // 0x00 FRAME_LEN   (RW) : LFM, number of transactions per frame
+    // 0x04 FRAME_CNT   (RO) : increments on each dma_done
+    // 0x08 STATUS      (RO) : {29'd0, eof_pulse, dma_busy, fifo_empty}
+    // 0x0C CONTROL     (RW) : {29'd0, force_tlast, manual_reinit, enable}
+    // 0x10 TRANS_NUM   (RO) : transition_num
+    // 0x14 DSAS_CYCLE  (RO) : dsas_cycle_num
+    // 0x18 DMA_LEN_B   (RO) : dma_length_bytes
+    // =========================================================================
+    localparam [AXIL_ADDR_WIDTH-1:0] REG_FRAME_LEN  = 6'h00;
+    localparam [AXIL_ADDR_WIDTH-1:0] REG_FRAME_CNT  = 6'h04;
+    localparam [AXIL_ADDR_WIDTH-1:0] REG_STATUS     = 6'h08;
+    localparam [AXIL_ADDR_WIDTH-1:0] REG_CONTROL    = 6'h0C;
+    localparam [AXIL_ADDR_WIDTH-1:0] REG_TRANS_NUM  = 6'h10;
+    localparam [AXIL_ADDR_WIDTH-1:0] REG_DSAS_CYC   = 6'h14;
+    localparam [AXIL_ADDR_WIDTH-1:0] REG_DMA_LENB   = 6'h18;
+
+    // Registers
+    reg [31:0] FRAME_LEN;     // programmable frame length (transactions)
+    reg [31:0] FRAME_CNT;     // frame counter (increments on dma_done)
+    reg        ctrl_enable;   // CONTROL[0]
+    reg        ctrl_reinit;   // CONTROL[1] (self-clear)
+    reg        ctrl_force_tl; // CONTROL[2] (self-clear)
+    wire       fifo_empty_status;
+    reg        dma_busy;
+    reg        eof_pulse;     // one-shot on frame boundary
+
+    assign fifo_empty_status = fifo_stream_empty;
+
+    // =========================================================================
+    // AXI-Lite slave simple implementation
+    // =========================================================================
+    // Write address/ready
+    always @(posedge s_axi_aclk) begin
+        if (!s_axi_aresetn) begin
+            s_axi_awready <= 1'b0;
+        end else begin
+            s_axi_awready <= s_axi_awvalid && !s_axi_awready && s_axi_wvalid && !s_axi_wready;
+        end
+    end
+
+    // Write data/ready + register write
+    wire write_fire = s_axi_awvalid && s_axi_awready && s_axi_wvalid && !s_axi_wready;
+
+    always @(posedge s_axi_aclk) begin
+        if (!s_axi_aresetn) begin
+            s_axi_wready   <= 1'b0;
+            FRAME_LEN      <= 32'd64; // nominal per paper
+            FRAME_CNT      <= 32'd0;
+            ctrl_enable    <= 1'b0;
+            ctrl_reinit    <= 1'b0;
+            ctrl_force_tl  <= 1'b0;
+        end else begin
+            s_axi_wready <= s_axi_awvalid && !s_axi_wready && s_axi_wvalid;
+
+            if (write_fire) begin
+                case (s_axi_awaddr & {{(AXIL_ADDR_WIDTH-2){1'b1}}, 2'b00})
+                    REG_FRAME_LEN: begin
+                        if (s_axi_wstrb[0]) FRAME_LEN[7:0]   <= s_axi_wdata[7:0];
+                        if (s_axi_wstrb[1]) FRAME_LEN[15:8]  <= s_axi_wdata[15:8];
+                        if (s_axi_wstrb[2]) FRAME_LEN[23:16] <= s_axi_wdata[23:16];
+                        if (s_axi_wstrb[3]) FRAME_LEN[31:24] <= s_axi_wdata[31:24];
+                    end
+                    REG_CONTROL: begin
+                        // CONTROL: [0]=enable, [1]=manual_reinit (self-clear), [2]=force_tlast (self-clear)
+                        if (s_axi_wstrb != 4'b0000) begin
+                            ctrl_enable   <= s_axi_wdata[0];
+                            ctrl_reinit   <= s_axi_wdata[1];
+                            ctrl_force_tl <= s_axi_wdata[2];
+                        end
+                    end
+                    default: ;
+                endcase
+            end
+
+            // self-clear one-shot control bits when seen by data-plane domain (sync below)
+            if (ctrl_reinit_seen)  ctrl_reinit  <= 1'b0;
+            if (ctrl_force_tl_seen)ctrl_force_tl<= 1'b0;
+        end
+    end
+
+    // Write response
+    always @(posedge s_axi_aclk) begin
+        if (!s_axi_aresetn) begin
+            s_axi_bvalid <= 1'b0;
+            s_axi_bresp  <= 2'b00;
+        end else begin
+            if (write_fire && !s_axi_bvalid) begin
+                s_axi_bvalid <= 1'b1;
+                s_axi_bresp  <= 2'b00; // OKAY
+            end else if (s_axi_bvalid && s_axi_bready) begin
+                s_axi_bvalid <= 1'b0;
+            end
+        end
+    end
+
+    // Read address
+    reg [AXIL_ADDR_WIDTH-1:0] araddr_q;
+    always @(posedge s_axi_aclk) begin
+        if (!s_axi_aresetn) begin
+            s_axi_arready <= 1'b0;
+            s_axi_rvalid  <= 1'b0;
+            s_axi_rdata   <= {AXIL_DATA_WIDTH{1'b0}};
+            s_axi_rresp   <= 2'b00;
+            araddr_q      <= {AXIL_ADDR_WIDTH{1'b0}};
+        end else begin
+            if (!s_axi_arready && s_axi_arvalid) begin
+                s_axi_arready <= 1'b1;
+                araddr_q      <= s_axi_araddr & {{(AXIL_ADDR_WIDTH-2){1'b1}}, 2'b00};
+            end else begin
+                s_axi_arready <= 1'b0;
+            end
+
+            if (s_axi_arready && s_axi_arvalid && !s_axi_rvalid) begin
+                // capture data for read
+                case (araddr_q)
+                    REG_FRAME_LEN: s_axi_rdata <= FRAME_LEN;
+                    REG_FRAME_CNT: s_axi_rdata <= FRAME_CNT;
+                    REG_STATUS:    s_axi_rdata <= {29'd0, eof_pulse, dma_busy, fifo_empty_status};
+                    REG_CONTROL:   s_axi_rdata <= {29'd0, ctrl_force_tl, ctrl_reinit, ctrl_enable};
+                    REG_TRANS_NUM: s_axi_rdata <= transition_num;
+                    REG_DSAS_CYC:  s_axi_rdata <= dsas_cycle_num;
+                    REG_DMA_LENB:  s_axi_rdata <= dma_length_bytes;
+                    default:       s_axi_rdata <= 32'hDEAD_BEEF;
+                endcase
+                s_axi_rvalid <= 1'b1;
+                s_axi_rresp  <= 2'b00; // OKAY
+            end else if (s_axi_rvalid && s_axi_rready) begin
+                s_axi_rvalid <= 1'b0;
+            end
+        end
+    end
+
+    // =========================================================================
+    // Cross-domain synchronizers: CONTROL one-shots into data plane
+    // =========================================================================
+    // Simple 2FF sync
+    reg [1:0] reinit_sync, force_sync, enable_sync;
+    always @(posedge clk) begin
+        if (!rstn) begin
+            reinit_sync  <= 2'b00;
+            force_sync   <= 2'b00;
+            enable_sync  <= 2'b00;
+        end else begin
+            reinit_sync  <= {reinit_sync[0],  ctrl_reinit};
+            force_sync   <= {force_sync[0],   ctrl_force_tl};
+            enable_sync  <= {enable_sync[0],  ctrl_enable};
+        end
+    end
+    wire ctrl_enable_dp   = enable_sync[1];
+    wire ctrl_reinit_dp   = reinit_sync[1];
+    wire ctrl_force_tl_dp = force_sync[1];
+
+    // Edge detectors to create one-cycle "seen" pulses back in AXI-Lite domain
+    reg reinit_seen_dp, force_seen_dp;
+    always @(posedge clk) begin
+        if (!rstn) begin
+            reinit_seen_dp <= 1'b0;
+            force_seen_dp  <= 1'b0;
+        end else begin
+            reinit_seen_dp <= ctrl_reinit_dp;
+            force_seen_dp  <= ctrl_force_tl_dp;
+        end
+    end
+    wire ctrl_reinit_seen = reinit_seen_dp;
+    wire ctrl_force_tl_seen = force_seen_dp;
+
+    // =========================================================================
+    // Data-plane FSM: Idle -> Capture -> Transfer
+    // =========================================================================
+    localparam [1:0] ST_IDLE    = 2'd0;
+    localparam [1:0] ST_CAPTURE = 2'd1;
+    localparam [1:0] ST_TRANSFER= 2'd2;
+
+    reg [1:0] state, state_n;
+
+    // Transaction accept handshake
+    wire accept = s_axis_tvalid && s_axis_tready;
+
+    // tready gating: hold off when DMA busy or FIFO near full/empty hazards
+    //   - Do not accept when fifo is empty (no data)
+    //   - Backpressure when DMA busy or almost_full reported
+    assign s_axis_tready = (state == ST_CAPTURE) &&
+                           !dma_busy &&
+                           !fifo_stream_almost_full &&
+                           !fifo_stream_empty;
+
+    // Counters and events
+    wire frame_boundary_reached = (transition_num == FRAME_LEN - 1);
+    reg  fifo_stream_empty_d;
+    wire fifo_stream_empty_neg = (fifo_stream_empty_d == 1'b1) && (fifo_stream_empty == 1'b0); // 1->0
+
+    always @(posedge clk) begin
+        if (!rstn) begin
+            fifo_stream_empty_d <= 1'b1;
+        end else begin
+            fifo_stream_empty_d <= fifo_stream_empty;
+        end
+    end
+
+    // FSM next-state logic
+    always @(*) begin
+        state_n = state;
+        case (state)
+            ST_IDLE: begin
+                if (ctrl_enable_dp) begin
+                    state_n = ST_CAPTURE;
+                end
+            end
+            ST_CAPTURE: begin
+                if (accept && frame_boundary_reached) begin
+                    state_n = ST_TRANSFER;
+                end
+            end
+            ST_TRANSFER: begin
+                if (dma_done) begin
+                    state_n = ST_CAPTURE;
+                end
+            end
+            default: state_n = ST_IDLE;
+        endcase
+    end
+
+    // FSM registers and outputs
+    always @(posedge clk) begin
+        if (!rstn) begin
+            state            <= ST_IDLE;
+            transition_num   <= 32'd0;
+            dsas_cycle_num   <= 32'd0;
+            s_axis_tlast     <= 1'b0;
+            dma_start        <= 1'b0;
+            dma_busy         <= 1'b0;
+            dma_length_bytes <= WBUS_BYTES * 32'd64;
+            FRAME_CNT        <= 32'd0;
+            eof_pulse        <= 1'b0;
+        end else begin
+            state <= state_n;
+
+            // default outputs
+            dma_start <= 1'b0;
+            s_axis_tlast <= 1'b0;
+            eof_pulse <= 1'b0;
+
+            // manual reinit
+            if (ctrl_reinit_dp) begin
+                transition_num <= 32'd0;
+            end
+
+            // DSAS global cycle index tracking:
+            //   Preserve user's original intent (increment on non-empty transition),
+            //   or increment on each accepted beat. Here we follow falling edge of empty.
+            if (fifo_stream_empty_neg) begin
+                dsas_cycle_num <= dsas_cycle_num + 32'd1;
+            end
+
+            case (state)
+                ST_IDLE: begin
+                    dma_busy <= 1'b0;
+                    if (ctrl_enable_dp) begin
+                        transition_num   <= 32'd0;
+                        dma_length_bytes <= FRAME_LEN * WBUS_BYTES[31:0];
+                    end
+                end
+                ST_CAPTURE: begin
+                    // Accept beats and count transactions in current frame
+                    if (accept) begin
+                        transition_num <= transition_num + 32'd1;
+
+                        // TLAST at boundary or when forced by control
+                        if (frame_boundary_reached || ctrl_force_tl_dp) begin
+                            s_axis_tlast <= 1'b1;
+                            eof_pulse    <= 1'b1;
+                        end
+                    end
+
+                    // When boundary reached and we just accepted it, arm DMA
+                    if (accept && (frame_boundary_reached || ctrl_force_tl_dp)) begin
+                        dma_length_bytes <= FRAME_LEN * WBUS_BYTES[31:0]; // update if FRAME_LEN changed
+                        dma_start        <= 1'b1;     // one-cycle pulse
+                        dma_busy         <= 1'b1;
+                        transition_num   <= 32'd0;    // re-arm for next frame
+                    end
+                end
+
+                ST_TRANSFER: begin
+                    // Hold busy until dma_done
+                    if (dma_done) begin
+                        dma_busy  <= 1'b0;
+                        FRAME_CNT <= FRAME_CNT + 32'd1;
+                    end
+                end
+            endcase
+        end
+    end
+
+endmodule
