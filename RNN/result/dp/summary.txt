@@ -1,0 +1,23 @@
+{
+  "model_path": "rnn_xy_shuffle.keras",
+  "input_path": "cordic_input_real_shuffled_1e4.txt",
+  "error_y_path": "cordic_series_databased_periodic.txt",
+  "error_mask_path": "cordic_series_databased_periodic_mask.txt",
+  "num_samples": 10000,
+  "auto_threshold": 0.24424455461867361,
+  "metrics_binary": {
+    "tp": 306,
+    "tn": 9500,
+    "fp": 0,
+    "fn": 194,
+    "accuracy": 0.9806,
+    "precision": 1.0,
+    "recall": 0.612,
+    "f1": 0.7593052109181141
+  },
+  "roc_auc": 0.8740575789473684,
+  "pr_auprc": 0.7977257243498224,
+  "classification": {
+    "executed": false
+  }
+}
