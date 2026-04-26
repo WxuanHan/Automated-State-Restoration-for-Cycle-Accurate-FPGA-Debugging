@@ -60,10 +60,10 @@ Overall, this directory serves as the main data source for both model developmen
 The 'result/' directory stores validation outputs grouped by anomaly type.
 
 The result categories correspond to the different injected error types, including:
-- random error
-- structural error
-- data-based aperiodic error
-- data-based periodic error
+- random error (r)
+- structural error (s)
+- data-based aperiodic error (da)
+- data-based periodic error (dp)
 
 Typical result files include:
 - local prediction-versus-reference plots
