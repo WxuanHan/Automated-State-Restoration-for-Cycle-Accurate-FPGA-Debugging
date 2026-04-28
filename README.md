@@ -187,8 +187,8 @@ For a quick overview of the project, the recommended reading order is:
 ## Tools and Technologies
 
 This project involves:
-- Verilog / RTL design
-- bare-metal C
+- Verilog / RTL design (Xilinx Vivado 2022.1)
+- bare-metal C (Xilinx Vitis 2022.1)
 - Python
 - TensorFlow / Keras
 - FIFO- and AXI-oriented FPGA integration
